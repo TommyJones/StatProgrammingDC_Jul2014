@@ -293,39 +293,3 @@ sfStop()
 
 ```
 
-Task 3: Extract keywords
-----------------------------
-
-### Same as summarization, just transpose your DTM first
-```{r keywords}
-
-sfInit(parallel=TRUE, cpus=4)
-
-sfLibrary(igraph)
-sfLibrary(openNLP)
-sfLibrary(NLP)
-sfLibrary(tm)
-sfLibrary(Matrix)
-
-sfExport(list=c("ParseSentences", "MakeSentenceDtm", "GetCsimGraph", "EvCentTopN"))
-
-keywords <- sfSapply(documents[ 1:4 ], function(DOC){
-    DOC <- ParseSentences(doc=DOC) # parse sentences
-    dtm <- MakeSentenceDtm(doc=DOC) # make a dtm
-    
-    dtm <- t(dtm > 0) # new step!
-    
-    csim <- dtm %*% t(dtm) # new step!
-    
-    top4 <- EvCentTopN(g=csim, N=4) # get the top 4 sentences
-    
-    result <- paste(DOC[ top4 ], collapse="\n")
-    
-    return(result)
-})
-
-sfStop()
-
-
-```
-
