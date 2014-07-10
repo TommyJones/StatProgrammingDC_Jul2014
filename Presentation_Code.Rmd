@@ -1,0 +1,331 @@
+Natural Language Processing In R
+========================================================
+Thomas Jones
+==============
+Delivered for Statistical Programming DC on July 9, 2014
+==========================================================
+
+Making a DTM
+-------------
+
+### Import documents 
+```{r setup}
+documents <- dir("data/WikiSubset/") # get document names
+
+getDocs <- function(DOC){
+    result <- scan(paste("data/WikiSubset/", DOC, sep=""), what="character", sep="\n") # read file
+        
+        # do some cleanup
+        result <- gsub("<[^<>]*>|\\{[^\\{\\}]*\\}|\"", "", result) # remove some html related things
+        
+        result <- result[ ! grepl("^$|^\\s+$", result) ] # keep only lines with text on them
+        
+        result <- gsub(" +|\t+", " ", result) # get rid of extra spaces and tabs
+        
+        result <- gsub("^ +| +$", "", result) # get rid of leading spaces and tabs
+        
+        result <- paste(result, collapse="\n") # collapse into a single-entry 
+        
+        return(result)
+}
+
+library(snowfall)
+sfInit(parallel=TRUE, cpus=4) # read in documents in parallel
+sfExport("getDocs")
+    documents <- sfSapply(documents, function(x) getDocs(DOC=x) )
+sfStop()
+
+```
+
+### Make a document term matrix with `tm`
+
+```{r dtm.tm}
+library(tm)
+##########################
+# Some Cleanup
+##########################
+corp <- Corpus(VectorSource(documents)) # make a corpus object
+
+corp <- tm_map(corp, tolower) # make everything lowercase
+
+corp <- tm_map(corp, removeWords, c(stopwords("english"), stopwords("smart"))) # remove stopwords
+
+corp <- tm_map(corp, removePunctuation) # remove punctuation
+
+corp <- tm_map(corp, removeNumbers) # remove numbers
+
+corp <- tm_map(corp, stripWhitespace) # get rid of extra spaces
+
+########################
+# Make the DTM
+########################
+dtm.tm <- DocumentTermMatrix(x=corp, control=list(weighting=weightTf)) # dtm of raw word counts
+
+
+```
+
+### Convert the document term matrix to a `Matrix` sparse matrix & drop additional terms
+```{r dtm.Matrix}
+library(slam)
+library(Matrix)
+########################
+# Conversion
+########################
+vocab <- Terms(dtm.tm) # preserve our vocabulary
+docnames <- Docs(dtm.tm) # preserve document names
+
+dtm.Matrix <- sparseMatrix(i=dtm.tm$i, j=dtm.tm$j, x=dtm.tm$v,  # converts to a sparse dtm
+                           dims=c(dtm.tm$nrow, dtm.tm$ncol))
+
+colnames(dtm.Matrix) <- vocab
+rownames(dtm.Matrix) <- docnames
+
+dim(dtm.Matrix) # how big is this matrix?
+
+########################
+# Drop Additional Terms
+########################
+
+doc.freq <- colSums(dtm.Matrix > 0) # get document frequency
+
+# drop terms in half or more of the documents or words that appear in 3 or fewer documents
+dtm.Matrix <- dtm.Matrix[ , doc.freq < nrow(dtm.Matrix)/2 & doc.freq > 3 ]
+
+dim(dtm.Matrix) # now how big is this matrix?
+
+# preview
+dtm.Matrix[ 1:10, 1:10 ]
+
+#######################
+# A note on memory
+#######################
+
+object.size(dtm.Matrix) # about 222 Kb
+
+object.size( as.matrix(dtm.Matrix) ) # about 828 Kb, almost 4 times bigger!
+
+```
+
+
+Task 1: Document Clustering
+-------------------------------
+
+### Make our DTM into a TF-IDF-weighted DTM
+```{r tfidf}
+
+idf <- log(nrow(dtm.Matrix) / colSums(dtm.Matrix > 0))
+
+dtm.Matrix <- dtm.Matrix / rowSums(dtm.Matrix) # normalize document length
+
+dtm.Matrix <- t(dtm.Matrix) * idf # transpose for correct multiplication
+
+dtm.Matrix <- t(dtm.Matrix) # get it back in the right format
+
+
+```
+
+
+
+### Get a cosine similarity matrix & convert it to an R `dist()` object
+```{r cosine}
+
+# make every vector unit length
+dtm.Matrix <- t(apply(dtm.Matrix, 1, function(x){
+    x <- x / sqrt(sum( x * x ))
+}))
+
+# matrix multiplication is fast in R!
+cosine.sim <- dtm.Matrix %*% t(dtm.Matrix)
+
+# make me a dist() object
+cos.dist <- as.dist( 1 - cosine.sim )
+
+```
+
+
+
+### Hierarchical clustering
+```{r cluster}
+
+clustering <- hclust(cos.dist, method="ward.D")
+clustering <- cutree(clustering, k=10) # 10 clusters is arbitrary
+
+
+# display our clusters nicely
+
+for( j in sort(unique(clustering))){
+    print("_________________________________________")
+    print(paste("cluster ", j))
+    print(names(clustering)[ clustering == j ])
+    print("_________________________________________")
+}
+
+```
+
+Task 2: Basic Document Summarization
+-------------------------------------
+
+### Make a sentence parsing function
+```{r sentence.parse}
+
+library(openNLP)
+library(NLP)
+
+ParseSentences <- function(doc){
+    ######################################################
+    # Takes a single document, stored as an entry of a
+    # character vector, and parses out the sentances. 
+    ######################################################
+    
+    annotator <- Maxent_Sent_Token_Annotator(language = "en") # uses the Apache OpenNLP 
+                                                             # Maxent sentence detector
+    
+    doc <- as.String(doc) # convert format for compatibility with OpenNLP
+    
+    sentence.boundaries <- annotate(doc, annotator) 
+    
+    result <- doc[ sentence.boundaries ] # extract those sentences!
+    
+    # if there aren't already names
+    # name each sentence
+    if( is.null(names(result)) ) names(result) <- paste("sen", 1:length(result), sep=".") 
+    
+    return(result)
+}
+
+```
+
+### Make a function to make a DTM with the sentence parser
+```{r sentence.dtm}
+
+MakeSentenceDtm <- function(doc){
+    #################################################
+    #   doc = character vector whose entries 
+    #       correspond to sentences in a document
+    #################################################
+    
+    ### pre-DTM cleanup
+    doc <- gsub("[^a-zA-Z]", " ", doc) # removes all non-alphabetic characters   
+    doc <- tolower(doc) #lowercase   
+    doc <- gsub(" +", " ", doc) # removes extra spaces    
+    corp <- Corpus(VectorSource(doc))
+    corp <- tm_map(corp, removeWords, # remove stopwords
+                   gsub("[^a-zA-Z]", " ", c(stopwords("english"), stopwords("SMART")) ) )     
+    corp <- tm_map(corp, stripWhitespace) # remove spaces again
+    
+    ### tm DTM
+    dtm <- DocumentTermMatrix(corp)    
+    ### Matrix DTM
+    dtm.sparse <- sparseMatrix(i=dtm$i, j=dtm$j, x=dtm$v,  # converts to a sparse dtm
+                               dims=c(dtm$nrow, dtm$ncol))   
+    rownames(dtm.sparse) <- Docs(dtm)
+    colnames(dtm.sparse) <- Terms(dtm)
+       
+    return(dtm.sparse)
+}
+
+
+```
+
+### Function to get cosine similarity matrix, and turn it into a graph
+```{r sentence.csim}
+
+library(igraph)
+
+GetCsimGraph <- function(dtm){
+    dtm <- t( apply(dtm, 1, function(x){
+        x <- x / sqrt(sum(x*x))
+        return(x)
+    }))
+
+    csim <- dtm %*% t(dtm)
+    
+    g <- graph.adjacency(adjmatrix=csim, mode="undirected", weighted=TRUE, diag=FALSE)
+    
+    return(g)
+}
+
+```
+
+### Function to get top N nodes by eigenvector centrality
+```{r sentence.evcent}
+EvCentTopN <- function(g, N){
+    # top N sentences (keywords) based on eigenvector centrality
+    top.n <- evcent(graph=g)
+    top.n <- names(top.n$vector)[ order(top.n$vector, decreasing=TRUE) ][ 1:N ]
+    
+    return(top.n)
+}
+```
+
+### Pull it together for a centrality document
+```{r sentence.summary}
+
+sfInit(parallel=TRUE, cpus=4)
+
+sfLibrary(igraph)
+sfLibrary(openNLP)
+sfLibrary(NLP)
+sfLibrary(tm)
+sfLibrary(Matrix)
+
+sfExport(list=c("ParseSentences", "MakeSentenceDtm", "GetCsimGraph", "EvCentTopN"))
+
+summaries <- sfSapply(documents, function(DOC){
+    DOC <- ParseSentences(doc=DOC) # parse sentences
+    dtm <- MakeSentenceDtm(doc=DOC) # make a dtm
+    
+    # keep only sentences that have at between 5 and 20 words
+    # this is arbitrary and could be adjusted/improved
+    dtm <- dtm[ rowSums(dtm) %in% 5:20, ] 
+
+    
+    csim <- GetCsimGraph(dtm=dtm) # get cosine similarity graph
+    top4 <- EvCentTopN(g=csim, N=4) # get the top 4 sentences
+    
+    result <- paste(DOC[ top4 ], collapse="\n")
+    
+    return(result)
+})
+
+sfStop()
+
+
+```
+
+Task 3: Extract keywords
+----------------------------
+
+### Same as summarization, just transpose your DTM first
+```{r keywords}
+
+sfInit(parallel=TRUE, cpus=4)
+
+sfLibrary(igraph)
+sfLibrary(openNLP)
+sfLibrary(NLP)
+sfLibrary(tm)
+sfLibrary(Matrix)
+
+sfExport(list=c("ParseSentences", "MakeSentenceDtm", "GetCsimGraph", "EvCentTopN"))
+
+keywords <- sfSapply(documents[ 1:4 ], function(DOC){
+    DOC <- ParseSentences(doc=DOC) # parse sentences
+    dtm <- MakeSentenceDtm(doc=DOC) # make a dtm
+    
+    dtm <- t(dtm > 0) # new step!
+    
+    csim <- dtm %*% t(dtm) # new step!
+    
+    top4 <- EvCentTopN(g=csim, N=4) # get the top 4 sentences
+    
+    result <- paste(DOC[ top4 ], collapse="\n")
+    
+    return(result)
+})
+
+sfStop()
+
+
+```
+
